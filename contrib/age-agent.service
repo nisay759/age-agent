@@ -1,0 +1,11 @@
+[Unit]
+Description=age-agent: cached age identities
+
+[Service]
+ExecStart=%h/.cargo/bin/age-agent daemon --foreground
+Restart=on-failure
+LimitCORE=0
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=default.target

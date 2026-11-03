@@ -1,0 +1,9 @@
+# `cargo audit` policy (SEC-10). Every ignored advisory must say why it is unreachable.
+[advisories]
+ignore = [
+    # crypto-bigint 0.5 timing variability, pulled in by age -> p256 -> elliptic-curve.
+    # Not reachable: age-agent runs only X25519 (x25519-dalek) and scrypt; the plugin forwards
+    # only X25519 stanzas and no P-256 identity or recipient is ever constructed. Clears when
+    # age/p256 move to crypto-bigint >= 0.7.6.
+    "RUSTSEC-2026-0387",
+]

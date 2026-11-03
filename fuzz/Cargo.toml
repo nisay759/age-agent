@@ -1,0 +1,26 @@
+[package]
+name = "age-agent-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+age-agent = { path = ".." }
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stub"
+path = "fuzz_targets/stub.rs"
+test = false
+doc = false
+bench = false
