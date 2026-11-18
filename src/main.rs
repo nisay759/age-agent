@@ -1,6 +1,5 @@
 use std::fs;
 use std::io::{self, ErrorKind};
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -50,6 +49,10 @@ enum Cmd {
     },
     /// Lock, then exit the daemon
     Stop,
+    /// A pinentry backed by the Windows credential dialog (used by the plugin)
+    #[cfg(windows)]
+    #[command(hide = true)]
+    NativePinentry,
 }
 
 fn main() -> ExitCode {
@@ -86,6 +89,11 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
                 Err(client::Error::Io(e)) if no_daemon(&e) => {}
                 Err(e) => return Err(e.into()),
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        #[cfg(windows)]
+        Cmd::NativePinentry => {
+            prompt::run_native_pinentry()?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Stop => {
@@ -154,7 +162,7 @@ fn print_status(s: &age_agent::protocol::Status, with_recipients: bool) {
     println!("unlocked ({} identities)", s.recipients.len());
     if !s.memory_locked {
         // The daemon's own warning is lost when a plugin auto-started it with stderr closed.
-        println!("warning: identities are not in locked memory (raise RLIMIT_MEMLOCK); they may reach swap");
+        println!("warning: identities are not in locked memory ({MEMLOCK_HINT}); they may reach swap");
     }
     if let Some(t) = s.idle_left_s {
         println!("idle timeout in {}", human(t));
@@ -187,7 +195,7 @@ fn setup(force: bool, print_env: bool, files: &[String]) -> Result<ExitCode> {
         let mut stubs = String::from("# Written by `age-agent setup`. Holds no secret.\n");
         cfg.identities.clear();
         for file in files {
-            let path = fs::canonicalize(config::expand_tilde(file)?)?;
+            let path = config::canonical(&config::expand_tilde(file)?)?;
             let loaded = load_with_prompt(&path, &mut passphrase)?;
             if loaded.is_empty() {
                 return Err(format!("{} holds no identities", path.display()).into());
@@ -202,14 +210,18 @@ fn setup(force: bool, print_env: bool, files: &[String]) -> Result<ExitCode> {
         let dir = stubs_path.parent().expect("stub path has a parent");
         fs::create_dir_all(dir)?;
         fs::write(&stubs_path, stubs)?;
-        fs::set_permissions(&stubs_path, fs::Permissions::from_mode(0o644))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&stubs_path, fs::Permissions::from_mode(0o644))?;
+        }
         cfg.save()?;
         println!("wrote {} and {}", stubs_path.display(), config::config_path()?.display());
     } else if !print_env {
         return Err("give at least one identity file".into());
     }
     if print_env || !files.is_empty() {
-        println!("export PASSAGE_IDENTITIES_FILE={}", stubs_path.display());
+        print_env_lines(&stubs_path);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -237,4 +249,22 @@ fn tilde(p: &Path) -> String {
         Some(rest) => format!("~/{}", rest.display()),
         None => p.display().to_string(),
     }
+}
+
+#[cfg(unix)]
+const MEMLOCK_HINT: &str = "raise RLIMIT_MEMLOCK";
+#[cfg(windows)]
+const MEMLOCK_HINT: &str = "VirtualLock failed";
+
+#[cfg(unix)]
+fn print_env_lines(stubs: &Path) {
+    println!("export PASSAGE_IDENTITIES_FILE={}", stubs.display());
+}
+
+/// Git Bash (where passage runs) and PowerShell; quoted so the backslashes survive.
+#[cfg(windows)]
+fn print_env_lines(stubs: &Path) {
+    let p = stubs.display().to_string();
+    println!("export PASSAGE_IDENTITIES_FILE='{}'", p.replace('\'', r"'\''"));
+    println!("[Environment]::SetEnvironmentVariable('PASSAGE_IDENTITIES_FILE', '{}', 'User')", p.replace('\'', "''"));
 }

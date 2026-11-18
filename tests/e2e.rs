@@ -1,5 +1,6 @@
 //! End to end on Linux: real daemon, real `age-plugin-agent`, driven by the `age` crate's
 //! plugin client, with a fake pinentry.
+#![cfg(unix)]
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;

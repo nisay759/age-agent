@@ -174,16 +174,33 @@ fn ask_passphrase(
         Some(n) => format!("{n}\nUnlock age-agent"),
         None => "Unlock age-agent".to_string(),
     };
-    if cfg.prompt.mode != "pinentry" {
+    let mode = cfg.prompt.mode.as_str();
+    if mode == "auto" || mode == "terminal" {
         match callbacks.request_secret(&message) {
             Ok(Ok(s)) => {
                 cancel.check()?; // the answer may arrive after a lock; discard it
                 return Ok(s);
             }
-            _ if cfg.prompt.mode != "terminal" => {}
+            _ if mode != "terminal" => {}
             Ok(Err(e)) => return Err(io::Error::other(format!("passphrase request failed: {e:?}"))),
             Err(e) => return Err(e),
         }
     }
-    prompt::pinentry(&prompt::pinentry_path(&cfg.prompt)?, &message, cancel)
+    match mode {
+        "native" => native_prompt(&message, cancel),
+        // UNL-5: on Windows, the native dialog unless a pinentry is configured.
+        "auto" if cfg!(windows) && cfg.prompt.pinentry.is_none() => native_prompt(&message, cancel),
+        "auto" | "pinentry" => prompt::pinentry(&prompt::pinentry_path(&cfg.prompt)?, &message, cancel),
+        other => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown prompt.mode {other:?}"))),
+    }
+}
+
+#[cfg(windows)]
+fn native_prompt(message: &str, cancel: &prompt::Cancel) -> io::Result<SecretString> {
+    prompt::native(message, cancel)
+}
+
+#[cfg(unix)]
+fn native_prompt(_message: &str, _cancel: &prompt::Cancel) -> io::Result<SecretString> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "prompt.mode = \"native\" is only available on Windows"))
 }
