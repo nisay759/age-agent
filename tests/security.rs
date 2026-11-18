@@ -1,4 +1,5 @@
 //! M2 security tests (spec: "Stack, testing and acceptance → Security").
+#![cfg(unix)]
 
 mod common;
 

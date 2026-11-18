@@ -90,6 +90,7 @@ dependencies = [
  "sha2 0.10.9",
  "signal-hook",
  "toml 0.8.23",
+ "windows-sys",
  "zbus",
  "zeroize",
 ]

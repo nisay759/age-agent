@@ -1,5 +1,6 @@
 //! No file under the user's home or runtime dir may ever contain the identity or passphrase.
 //! Runs a whole session through the real plugin while a polling watcher scans both trees.
+#![cfg(unix)]
 
 mod common;
 

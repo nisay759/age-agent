@@ -1,12 +1,10 @@
 //! The long-running daemon: holds unlocked identities and unwraps stanzas on request.
 
 use std::io::{self, ErrorKind};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use std::{fs, thread};
+use std::thread;
 
 use age::Identity;
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
@@ -93,6 +91,11 @@ impl Daemon {
         Self { state: Mutex::new(inner), changed: Condvar::new(), unlock_gate: Mutex::new(()), load_config, socket }
     }
 
+    /// The socket path or pipe name this daemon serves.
+    pub fn endpoint(&self) -> &std::path::Path {
+        &self.socket
+    }
+
     fn state(&self) -> MutexGuard<'_, Inner> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -129,7 +132,7 @@ impl Daemon {
 
     /// Blocks until the epoch moves past `epoch`, the timeout, or the peer hangs up (`None`).
     /// Without the claim, it also returns once nobody holds it.
-    fn wait(&self, stream: &UnixStream, epoch: u64, claimed: bool, timeout: Duration) -> Option<Response> {
+    fn wait(&self, stream: &sys::Stream, epoch: u64, claimed: bool, timeout: Duration) -> Option<Response> {
         let deadline = Instant::now() + timeout.min(protocol::MAX_WAIT);
         let mut inner = self.state();
         let changed = loop {
@@ -163,7 +166,7 @@ impl Daemon {
                 let socket = self.socket.clone();
                 thread::spawn(move || {
                     thread::sleep(Duration::from_millis(100));
-                    let _ = fs::remove_file(socket);
+                    sys::remove_endpoint(&socket);
                     std::process::exit(0);
                 });
                 Response::ok()
@@ -269,15 +272,15 @@ impl Daemon {
     }
 
     /// LCK-4: wipe, remove the socket, exit.
-    fn shutdown(&self) -> ! {
+    pub fn shutdown(&self) -> ! {
         self.lock();
-        let _ = fs::remove_file(&self.socket);
+        sys::remove_endpoint(&self.socket);
         std::process::exit(0);
     }
 
-    fn serve_conn(&self, mut stream: UnixStream) -> io::Result<()> {
-        // SEC-4: peer UID check on every connection.
-        if sys::peer_uid(&stream)? != sys::current_uid() {
+    fn serve_conn(&self, mut stream: sys::Stream) -> io::Result<()> {
+        // SEC-4 / SEC-5: peer user check on every connection.
+        if !sys::peer_is_us(&stream)? {
             return Ok(());
         }
         stream.set_read_timeout(Some(CONN_READ_TIMEOUT))?;
@@ -289,7 +292,7 @@ impl Daemon {
         result
     }
 
-    fn serve_requests(&self, stream: &mut UnixStream, claimed: &mut bool) -> io::Result<()> {
+    fn serve_requests(&self, stream: &mut sys::Stream, claimed: &mut bool) -> io::Result<()> {
         let mut greeted = false;
         loop {
             let frame = match protocol::read_frame(stream) {
@@ -331,54 +334,36 @@ impl Daemon {
     }
 }
 
-/// Binds the socket, refusing to start when a live daemon holds it (DMN-2) and checking
-/// the parent directory is ours and private (SEC-4).
-fn bind(socket: &Path) -> io::Result<UnixListener> {
-    let dir = socket.parent().expect("socket path has a parent");
-    if !dir.exists() {
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    }
-    let meta = fs::symlink_metadata(dir)?;
-    if !meta.is_dir() || meta.uid() != sys::current_uid() || meta.mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            format!("{} must be a directory owned by you with mode 0700", dir.display()),
-        ));
-    }
-    match UnixListener::bind(socket) {
-        Ok(l) => Ok(l),
-        Err(e) if e.kind() == ErrorKind::AddrInUse => {
-            if UnixStream::connect(socket).is_ok() {
-                return Err(io::Error::new(ErrorKind::AddrInUse, "age-agent is already running"));
+/// Exits cleanly on SIGTERM, SIGINT (LCK-4); SIGHUP is ignored.
+#[cfg(unix)]
+fn on_termination(daemon: Arc<Daemon>) -> io::Result<()> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP])?;
+    thread::spawn(move || {
+        for sig in signals.forever() {
+            if sig != SIGHUP {
+                daemon.shutdown();
             }
-            fs::remove_file(socket)?;
-            UnixListener::bind(socket)
         }
-        Err(e) => Err(e),
-    }
+    });
+    Ok(())
+}
+
+/// Exits cleanly on Ctrl-C, Ctrl-Break and console close (LCK-4). Log-off arrives as
+/// `WM_ENDSESSION`, handled by the auto-lock window.
+#[cfg(windows)]
+fn on_termination(daemon: Arc<Daemon>) -> io::Result<()> {
+    sys::on_console_ctrl(move || daemon.shutdown());
+    Ok(())
 }
 
 /// Runs the daemon in this process until stopped.
 pub fn run(socket: PathBuf, load_config: fn() -> io::Result<Config>) -> io::Result<()> {
     // Harden before the socket exists, so no client can ever talk to a dumpable daemon.
     sys::harden_process();
-    let listener = bind(&socket)?;
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    let listener = sys::Listener::bind(&socket)?;
     let daemon = Arc::new(Daemon::new(socket, load_config));
-
-    let mut signals = signal_hook::iterator::Signals::new([
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGHUP,
-    ])?;
-    let d = daemon.clone();
-    thread::spawn(move || {
-        for sig in signals.forever() {
-            if sig != signal_hook::consts::SIGHUP {
-                d.shutdown();
-            }
-        }
-    });
+    on_termination(daemon.clone())?;
     match load_config() {
         Ok(cfg) => crate::autolock::spawn(daemon.clone(), cfg.agent.lock_on_screen_lock, cfg.agent.lock_on_suspend),
         Err(e) => eprintln!("age-agent: auto-lock disabled, bad config: {e}"),
@@ -391,16 +376,19 @@ pub fn run(socket: PathBuf, load_config: fn() -> io::Result<Config>) -> io::Resu
         }
     });
 
-    for conn in listener.incoming() {
-        let Ok(conn) = conn else { continue };
-        let d = daemon.clone();
-        thread::spawn(move || {
-            let _ = d.serve_conn(conn);
-        });
+    loop {
+        match listener.accept() {
+            Ok(conn) => {
+                let d = daemon.clone();
+                thread::spawn(move || {
+                    let _ = d.serve_conn(conn);
+                });
+            }
+            // Never spin on a persistent error (e.g. out of handles).
+            Err(_) => thread::sleep(Duration::from_millis(50)),
+        }
     }
-    Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

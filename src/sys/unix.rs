@@ -1,8 +1,13 @@
-//! The only module with `unsafe` code (SEC-9): process hardening and peer credentials.
+//! Linux and macOS: Unix socket with peer UID checks, `mlock`, no core dumps.
 
-use std::io;
+use std::fs;
+use std::io::{self, ErrorKind};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
+
+pub type Stream = UnixStream;
 
 /// SEC-2: no core dumps and no ptrace/proc-mem reads by same-user processes.
 pub fn harden_process() {
@@ -72,6 +77,11 @@ pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     }
 }
 
+/// SEC-4: whether the other end of the socket runs as our user (used in both directions).
+pub fn peer_is_us(stream: &Stream) -> io::Result<bool> {
+    Ok(peer_uid(stream)? == current_uid())
+}
+
 /// True when the peer closed the connection; never blocks and never consumes data.
 pub fn peer_hung_up(stream: &UnixStream) -> bool {
     let mut b = 0u8;
@@ -92,22 +102,54 @@ pub fn terminate(pid: u32) {
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
 }
 
-/// Overwrites the stack below the caller's frame, where callees that just returned left
-/// copies of secrets (parsing an identity moves 32-byte keys through several frames).
-/// Best effort, like libsodium's `sodium_stackzero`: the frames are reused, not reserved.
-#[inline(never)]
-pub fn stack_zero() {
-    let mut buf = [0u8; 128 * 1024];
-    for b in buf.iter_mut() {
-        // SAFETY: `b` is a valid, aligned, exclusively borrowed byte.
-        unsafe { std::ptr::write_volatile(b, 0) };
-    }
-    std::hint::black_box(&buf);
-}
-
 pub fn current_uid() -> u32 {
     // SAFETY: getuid cannot fail and has no preconditions.
     unsafe { libc::getuid() }
+}
+
+pub fn connect(path: &Path) -> io::Result<Stream> {
+    UnixStream::connect(path)
+}
+
+pub struct Listener(UnixListener);
+
+impl Listener {
+    /// Binds the socket, refusing to start when a live daemon holds it (DMN-2) and checking
+    /// the parent directory is ours and private (SEC-4).
+    pub fn bind(socket: &Path) -> io::Result<Self> {
+        let dir = socket.parent().expect("socket path has a parent");
+        if !dir.exists() {
+            fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        }
+        let meta = fs::symlink_metadata(dir)?;
+        if !meta.is_dir() || meta.uid() != current_uid() || meta.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!("{} must be a directory owned by you with mode 0700", dir.display()),
+            ));
+        }
+        let listener = match UnixListener::bind(socket) {
+            Ok(l) => l,
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                if UnixStream::connect(socket).is_ok() {
+                    return Err(io::Error::new(ErrorKind::AddrInUse, "age-agent is already running"));
+                }
+                fs::remove_file(socket)?;
+                UnixListener::bind(socket)?
+            }
+            Err(e) => return Err(e),
+        };
+        fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+        Ok(Self(listener))
+    }
+
+    pub fn accept(&self) -> io::Result<Stream> {
+        self.0.accept().map(|(s, _)| s)
+    }
+}
+
+pub fn remove_endpoint(socket: &Path) {
+    let _ = fs::remove_file(socket);
 }
 
 #[cfg(test)]
@@ -132,5 +174,6 @@ mod tests {
     fn peer_uid_of_socketpair_is_ours() {
         let (a, _b) = UnixStream::pair().unwrap();
         assert_eq!(peer_uid(&a).unwrap(), current_uid());
+        assert!(peer_is_us(&a).unwrap());
     }
 }

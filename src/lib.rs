@@ -9,4 +9,8 @@ pub mod protocol;
 pub mod stub;
 pub mod sys;
 pub mod plugin;
+#[cfg(unix)]
+pub mod autolock;
+#[cfg(windows)]
+#[path = "autolock_windows.rs"]
 pub mod autolock;

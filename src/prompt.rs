@@ -1,7 +1,8 @@
-//! Passphrase prompts: the controlling terminal, or a pinentry program (UNL-2).
+//! Passphrase prompts: the controlling terminal, a pinentry program (UNL-2), or on Windows
+//! the native credential dialog (UNL-5), which runs as a built-in pinentry.
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -12,11 +13,38 @@ use zeroize::Zeroizing;
 
 use crate::config::PromptConfig;
 
-/// rpassword reads from `/dev/tty` with echo off, so this works under pipes and plugins.
+#[cfg(unix)]
+const TTY: &str = "/dev/tty";
+#[cfg(windows)]
+const TTY: &str = "CONOUT$";
+
+/// rpassword reads from the terminal (`/dev/tty`, or the Windows console) with echo off,
+/// so this works under pipes and plugins.
 pub fn terminal(message: &str) -> io::Result<SecretString> {
-    let mut tty = File::options().write(true).open("/dev/tty")?;
+    let mut tty = File::options().write(true).open(TTY)?;
     writeln!(tty, "{message}")?;
     rpassword::prompt_password("Passphrase: ").map(SecretString::from)
+}
+
+/// Fixed locations searched when `prompt.pinentry` is unset (SEC-8).
+#[cfg(unix)]
+fn system_pinentries() -> Vec<PathBuf> {
+    ["/usr/bin/pinentry", "/usr/local/bin/pinentry", "/opt/homebrew/bin/pinentry", "/usr/bin/pinentry-mac"]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Gpg4win's and GnuPG's pinentries under Program Files, located through the shell's
+/// known folders, not the environment.
+#[cfg(windows)]
+fn system_pinentries() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in crate::sys::program_files_dirs() {
+        out.push(dir.join(r"Gpg4win\bin\pinentry.exe"));
+        out.push(dir.join(r"GnuPG\bin\pinentry-basic.exe"));
+    }
+    out
 }
 
 /// SEC-8: the pinentry path comes from the config file and must be absolute. With no
@@ -29,9 +57,8 @@ pub fn pinentry_path(cfg: &PromptConfig) -> io::Result<PathBuf> {
         }
         return Ok(p.to_path_buf());
     }
-    ["/usr/bin/pinentry", "/usr/local/bin/pinentry", "/opt/homebrew/bin/pinentry", "/usr/bin/pinentry-mac"]
-        .iter()
-        .map(PathBuf::from)
+    system_pinentries()
+        .into_iter()
         .find(|p| p.exists())
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no pinentry found; set prompt.pinentry in config.toml"))
 }
@@ -67,8 +94,27 @@ impl Cancel {
 /// Minimal Assuan client: `GETPIN`. The pinentry's stdout is read without a `BufReader`,
 /// whose buffer would keep an unzeroized copy of the `D <passphrase>` line.
 pub fn pinentry(path: &Path, description: &str, cancel: &Cancel) -> io::Result<SecretString> {
+    pinentry_command(Command::new(path), description, cancel)
+}
+
+/// UNL-5: the Windows credential dialog, shown by `age-agent native-pinentry` so that a
+/// lock can cancel it by killing that process, like any pinentry.
+#[cfg(windows)]
+pub fn native(description: &str, cancel: &Cancel) -> io::Result<SecretString> {
+    let mut cmd = Command::new(crate::client::sibling_binary("age-agent")?);
+    cmd.arg("native-pinentry");
+    pinentry_command(cmd, description, cancel)
+}
+
+fn pinentry_command(mut cmd: Command, description: &str, cancel: &Cancel) -> io::Result<SecretString> {
     cancel.check()?;
-    let mut child = Command::new(path).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    #[cfg(windows)]
+    {
+        // A console pinentry (or our own) must not flash a console window.
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
     *cancel.pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(child.id());
     if cancel.is_cancelled() {
         crate::sys::terminate(child.id()); // cancelled between the check and the spawn
@@ -175,10 +221,90 @@ fn unescape_into(src: &[u8], dst: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
+/// The server half of the Assuan exchange above, enough for `age-agent native-pinentry`:
+/// `SETTITLE`, `SETDESC`, `GETPIN` and `BYE`, `OK` to anything else. `getpin(title, desc)`
+/// returns `None` when the user cancels. Each `D` line is built and written in one call
+/// from a zeroized buffer.
+pub fn serve_assuan(
+    input: impl BufRead,
+    out: &mut impl Write,
+    mut getpin: impl FnMut(&str, &str) -> io::Result<Option<Zeroizing<String>>>,
+) -> io::Result<()> {
+    let (mut title, mut desc) = (String::from("age-agent"), String::new());
+    out.write_all(b"OK age-agent native pinentry\n")?;
+    for line in input.lines() {
+        let line = line?;
+        let (cmd, arg) = line.split_once(' ').unwrap_or((&line, ""));
+        let decode = |s: &str| {
+            let mut v = Vec::with_capacity(s.len());
+            unescape_into(s.as_bytes(), &mut v).map(|()| String::from_utf8_lossy(&v).into_owned())
+        };
+        match cmd {
+            "SETTITLE" => title = decode(arg)?,
+            "SETDESC" => desc = decode(arg)?,
+            "BYE" => return out.write_all(b"OK closing connection\n"),
+            "GETPIN" => {
+                match getpin(&title, &desc) {
+                    Ok(Some(pin)) => {
+                        let mut reply = Zeroizing::new(Vec::with_capacity(pin.len() * 3 + 8));
+                        reply.extend_from_slice(b"D ");
+                        for &b in pin.as_bytes() {
+                            match b {
+                                b'%' | b'\r' | b'\n' => reply.extend_from_slice(format!("%{b:02X}").as_bytes()),
+                                b => reply.push(b),
+                            }
+                        }
+                        reply.extend_from_slice(b"\nOK\n");
+                        out.write_all(&reply)?;
+                    }
+                    Ok(None) => out.write_all(b"ERR 83886179 Operation cancelled\n")?,
+                    Err(e) => out.write_all(format!("ERR 83886081 {}\n", escape(&e.to_string())).as_bytes())?,
+                }
+                out.flush()?;
+                continue;
+            }
+            _ => {}
+        }
+        out.write_all(b"OK\n")?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+/// `age-agent native-pinentry`: a pinentry on stdio backed by the Windows credential dialog.
+#[cfg(windows)]
+pub fn run_native_pinentry() -> io::Result<()> {
+    serve_assuan(io::stdin().lock(), &mut io::stdout().lock(), |title, desc| {
+        crate::sys::credential_prompt(title, desc)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use secrecy::ExposeSecret;
+
+    #[test]
+    fn assuan_server_talks_to_our_client() {
+        use std::io::Cursor;
+        let mut requests = Vec::new();
+        // Drive the client against a canned transcript of what our server answers.
+        let mut server_out = Vec::new();
+        let script = "SETTITLE age-agent\nSETDESC Wrong%0Aagain\nSETPROMPT Passphrase:\nGETPIN\nBYE\n";
+        serve_assuan(Cursor::new(script), &mut server_out, |title, desc| {
+            requests.push((title.to_owned(), desc.to_owned()));
+            Ok(Some(Zeroizing::new("p%ss\nwörd".to_owned())))
+        })
+        .unwrap();
+        assert_eq!(requests, [("age-agent".to_owned(), "Wrong\nagain".to_owned())]);
+        let pin = assuan_getpin(&mut server_out.as_slice(), &mut Vec::new(), "x").unwrap();
+        assert_eq!(pin.expose_secret(), "p%ss\nwörd");
+
+        let mut cancelled = Vec::new();
+        serve_assuan(Cursor::new("GETPIN\n"), &mut cancelled, |_, _| Ok(None)).unwrap();
+        let text = String::from_utf8(cancelled).unwrap();
+        assert!(text.ends_with("ERR 83886179 Operation cancelled\n"), "{text}");
+    }
 
     #[test]
     fn assuan_exchange() {

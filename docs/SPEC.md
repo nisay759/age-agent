@@ -251,7 +251,12 @@ Linux first, because that is where every assumption below gets validated; Window
 
 1. **M1 — Linux prototype:** plugin, daemon, terminal unlock, idle timeout, X25519 unwrap. Answers open questions 1 and 3.
 2. **M2 — Linux complete:** pinentry fallback, logind and screensaver auto-lock, `status --json`, systemd user unit, security tests.
-3. **M3 — Windows:** named pipe with SID and squatting checks, native credential prompt, session-lock and suspend auto-lock, detached auto-start.
+3. **M3 — Windows:** named pipe with SID and squatting checks, native credential prompt, session-lock and suspend auto-lock, detached auto-start. **Done**, with these implementation notes:
+   - `windows-sys` (raw bindings, same project as `windows`) instead of the `windows` crate, to keep dependencies small.
+   - The native prompt runs as `age-agent native-pinentry`, an Assuan pinentry backed by CredUI, so `age-agent lock` cancels it by killing that process, as with any pinentry.
+   - SEC-2 on Windows: no crash dialogs, `WER_FAULT_REPORTING_FLAG_NOHEAP`, and a protected process DACL (with an Owner Rights entry) that leaves same-user processes only query, wait and terminate rights. Memory reads, thread injection and debugging are refused.
+   - The daemon is started with `CreateProcessW(bInheritHandles = FALSE)`: `std::process::Command` would pass the age client's stdio pipes on to the daemon and keep the client waiting for end-of-file.
+   - Untested here: a squatter running as another user (the tests create the pipe as the same user; the SID comparison is unit-tested against the System process), and the CredUI dialog itself, which needs a person at the keyboard.
 4. **M4 — 1.0:** fuzzing in CI, documentation, signed reproducible releases, packages (crates.io, AUR, Scoop or winget).
 5. **M5 — macOS:** launchd agent, pinentry-mac, lock notifications.
 

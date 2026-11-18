@@ -49,7 +49,7 @@ impl Default for AgentConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct PromptConfig {
-    /// auto | terminal | pinentry
+    /// auto | terminal | pinentry | native (Windows)
     pub mode: String,
     /// Absolute path only (SEC-8).
     pub pinentry: Option<String>,
@@ -103,8 +103,14 @@ pub fn parse_duration(s: &str) -> io::Result<Duration> {
     n.checked_mul(mult).map(Duration::from_secs).ok_or_else(bad)
 }
 
+/// `$XDG_CONFIG_HOME/age-agent`, else `~/.config/age-agent`; on Windows `%APPDATA%\age-agent`
+/// unless `XDG_CONFIG_HOME` is set.
 pub fn config_dir() -> io::Result<PathBuf> {
     if let Some(dir) = env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir).join("age-agent"));
+    }
+    #[cfg(windows)]
+    if let Some(dir) = env::var_os("APPDATA").filter(|d| !d.is_empty()) {
         return Ok(PathBuf::from(dir).join("age-agent"));
     }
     Ok(home()?.join(".config").join("age-agent"))
@@ -118,9 +124,26 @@ pub fn stub_file_path() -> io::Result<PathBuf> {
     Ok(config_dir()?.join("identities.txt"))
 }
 
+/// SEC-5: `\\.\pipe\age-agent-<user SID>`. `AGE_AGENT_INSTANCE` (letters, digits, `-`, `_`)
+/// appends a suffix to run a separate agent, e.g. for tests; the name always keeps the SID,
+/// and the client still checks who serves it.
+#[cfg(windows)]
+pub fn socket_path() -> io::Result<PathBuf> {
+    let mut name = format!(r"\\.\pipe\age-agent-{}", crate::sys::current_sid()?);
+    if let Some(inst) = env::var_os("AGE_AGENT_INSTANCE").filter(|i| !i.is_empty()) {
+        let inst = inst.to_str().filter(|i| {
+            i.len() <= 64 && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+        let inst = inst.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid AGE_AGENT_INSTANCE"))?;
+        name = format!("{name}-{inst}");
+    }
+    Ok(PathBuf::from(name))
+}
+
 /// SEC-4: `$XDG_RUNTIME_DIR/age-agent/agent.sock`. On Linux there is no fallback: the only
 /// candidate would sit under the shared `/tmp`, where another user can create the directory
 /// first and keep the agent from ever starting. macOS has a private per-user temp dir.
+#[cfg(unix)]
 pub fn socket_path() -> io::Result<PathBuf> {
     let base = match env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
         Some(d) => PathBuf::from(d),
@@ -136,17 +159,36 @@ pub fn socket_path() -> io::Result<PathBuf> {
     Ok(base.join("age-agent").join("agent.sock"))
 }
 
+/// `HOME`; on Windows `USERPROFILE` when `HOME` is unset (Git Bash and MSYS set `HOME`).
 pub fn home() -> io::Result<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
+    let var = |name| env::var_os(name).filter(|v| !v.is_empty());
+    #[cfg(windows)]
+    let home = var("HOME").or_else(|| var("USERPROFILE"));
+    #[cfg(unix)]
+    let home = var("HOME");
+    home.map(PathBuf::from).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
 }
 
 pub fn expand_tilde(p: &str) -> io::Result<PathBuf> {
-    match p.strip_prefix("~/") {
+    let rest = p.strip_prefix("~/").or_else(|| if cfg!(windows) { p.strip_prefix("~\\") } else { None });
+    match rest {
         Some(rest) => Ok(home()?.join(rest)),
         None => Ok(Path::new(p).to_path_buf()),
     }
+}
+
+/// An absolute, symlink-free path. On Windows `canonicalize` returns `\\?\C:\…`; the prefix
+/// is dropped when the plain form means the same, so the config stays readable.
+pub fn canonical(p: &Path) -> io::Result<PathBuf> {
+    let c = fs::canonicalize(p)?;
+    #[cfg(windows)]
+    if let Some(plain) = c.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        let b = plain.as_bytes();
+        if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' && plain.len() < 260 {
+            return Ok(PathBuf::from(plain));
+        }
+    }
+    Ok(c)
 }
 
 #[cfg(test)]

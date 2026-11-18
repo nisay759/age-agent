@@ -1,5 +1,6 @@
 //! Real clients (`age`, `rage`, `passage`) against the real daemon and plugin, run without a
 //! terminal like rofi would. Each test skips when its client is not installed.
+#![cfg(unix)]
 
 mod common;
 

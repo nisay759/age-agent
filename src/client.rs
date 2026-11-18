@@ -1,8 +1,8 @@
 //! Client side of the socket protocol, shared by the CLI and the plugin.
 
 use std::io::{self, ErrorKind};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,8 +16,12 @@ use crate::{config, sys};
 
 pub const UNLOCK_ATTEMPTS: usize = 3;
 
+/// A daemon answers `hello` at once; anything slower is not a daemon (a squatter that
+/// accepts and never replies must not hang the client).
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct Connection {
-    stream: UnixStream,
+    stream: sys::Stream,
 }
 
 #[derive(Debug)]
@@ -65,14 +69,19 @@ impl Connection {
     }
 
     pub fn connect_to(path: PathBuf) -> Result<Self, Error> {
-        let stream = UnixStream::connect(path)?;
+        let stream = sys::connect(&path)?;
         // Mirror of the daemon's check: never talk to a socket owned by someone else.
-        if sys::peer_uid(&stream)? != sys::current_uid() {
+        if !sys::peer_is_us(&stream)? {
             return Err(Error::Protocol("socket is served by another user".into()));
         }
+        stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
         let mut c = Connection { stream };
         match c.call(serde_json::json!({"type": "hello", "version": protocol::VERSION}))? {
-            Response::Hello { version, .. } if version == protocol::VERSION => Ok(c),
+            Response::Hello { version, .. } if version == protocol::VERSION => {
+                // `wait` legitimately blocks for minutes.
+                c.stream.set_read_timeout(None)?;
+                Ok(c)
+            }
             other => Err(Error::Protocol(format!("unexpected hello reply {other:?}"))),
         }
     }
@@ -155,7 +164,7 @@ impl Connection {
     }
 
     /// A handle that can hang up this connection from another thread, ending a `wait`.
-    pub fn hangup_handle(&self) -> io::Result<UnixStream> {
+    pub fn hangup_handle(&self) -> io::Result<sys::Stream> {
         self.stream.try_clone()
     }
 
@@ -193,10 +202,10 @@ impl Connection {
 }
 
 /// Starts `age-agent daemon --foreground` detached from the caller's terminal and process group.
+#[cfg(unix)]
 pub fn start_daemon() -> io::Result<()> {
     use std::os::unix::process::CommandExt;
-    let exe = sibling_binary("age-agent")?;
-    Command::new(exe)
+    Command::new(sibling_binary("age-agent")?)
         .args(["daemon", "--foreground"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -206,10 +215,28 @@ pub fn start_daemon() -> io::Result<()> {
         .map(|_| ())
 }
 
+/// Starts `age-agent daemon --foreground` with no console window, in its own process group
+/// (so the caller's Ctrl-C does not reach it) and, where the caller's job allows, outside
+/// the caller's job (so closing a terminal that kills its job does not take it along).
+#[cfg(windows)]
+pub fn start_daemon() -> io::Result<()> {
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let exe = sibling_binary("age-agent")?;
+    // The daemon outlives the caller: don't pin the caller's working directory.
+    let dir = exe.parent().map(PathBuf::from).unwrap_or_default();
+    let flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+    let args = ["daemon", "--foreground"];
+    sys::spawn_detached(&exe, &args, &dir, flags | CREATE_BREAKAWAY_FROM_JOB)
+        // Access denied: the caller's job forbids breakaway.
+        .or_else(|_| sys::spawn_detached(&exe, &args, &dir, flags))
+}
+
 /// The daemon binary is looked up next to the running executable, never via the caller's PATH.
-fn sibling_binary(name: &str) -> io::Result<PathBuf> {
+pub fn sibling_binary(name: &str) -> io::Result<PathBuf> {
     let me = std::env::current_exe()?;
-    let path = me.with_file_name(name);
+    let path = me.with_file_name(name).with_extension(std::env::consts::EXE_EXTENSION);
     if path.exists() {
         Ok(path)
     } else {

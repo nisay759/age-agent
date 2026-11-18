@@ -1,5 +1,6 @@
 //! LCK-3 end to end: the real daemon on private D-Bus buses, with a fake logind (owning
 //! `org.freedesktop.login1`) and a fake screensaver. Skips when `dbus-daemon` is missing.
+#![cfg(unix)]
 
 mod common;
 
